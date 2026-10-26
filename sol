@@ -1,39 +1,36 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-LOCK="/run/mlfs-update.lock"
-LOG="/var/log/mlfs-update.log"
-PKGLOG_DIR="/var/log/mlfs-update.d"
-CONF_DIR="/etc/mlfs-update"
+SOL_HOME="${SOL_HOME:-$HOME/.sol}"
+LOCK="$SOL_HOME/sol.lock"
+LOG="$SOL_HOME/sol.log"
+PKGLOG_DIR="$SOL_HOME/logs"
+CONF_DIR="$SOL_HOME"
 DB="$CONF_DIR/packages.db"
-RECIPES_DIR="$CONF_DIR/packages.d"
+RECIPES_DIR="$CONF_DIR/recipes"
 FROZEN_FILE="$CONF_DIR/frozen.txt"
 HOLDS_FILE="$CONF_DIR/holds.txt"
-SANITY="$CONF_DIR/sanity.sh"
-STATE_DIR="/var/lib/mlfs-update/state"
+STATE_DIR="$SOL_HOME/state"
 PROBE_CACHE="$STATE_DIR/probes"
-BUILD_DIR="/var/lib/mlfs-update/build"
-SNAP="/usr/sbin/mlfs-snapshot"
-NIX="/nix/var/nix/profiles/default/bin/nix"
-LIB="/usr/lib/mlfs-update"
+BUILD_DIR="$SOL_HOME/build"
+LIB="$SOL_HOME/lib"
 PROBE_TTL=$((6*3600))
 BUILD_TIMEOUT=5400
-JOBS="$(nproc)"
+JOBS="${SOL_JOBS:-$(nproc)}"
 
-source "$LIB/probe.sh"
-source "$LIB/guard.sh"
+mkdir -p "$SOL_HOME" "$STATE_DIR" "$BUILD_DIR" "$PKGLOG_DIR" "$PROBE_CACHE" "$LIB"
 
-say()  { printf '\033[1;32m[update]\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m[update]\033[0m %s\n' "$*" >&2; }
-fail() { printf '\033[1;31m[update]\033[0m %s\n' "$*" >&2; }
+say()  { printf '\033[1;32m[sol]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[sol]\033[0m %s\n' "$*" >&2; }
+fail() { printf '\033[1;31m[sol]\033[0m %s\n' "$*" >&2; }
 
-DO_FULL=0; DO_NVIDIA=0; DO_DRY=0; DO_LIST=0; DO_GAMING=0
-ALLOW_MAJOR=0; NO_CACHE=0; ONLY=""; SKIP=""; DO_NIX=1; DO_FP=1; FORCE=0
+DO_FULL=0; DO_DRY=0; DO_LIST=0
+ALLOW_MAJOR=0; NO_CACHE=0; ONLY=""; SKIP=""; FORCE=0
 
 cmd_hold() {
     local n="$1"
-    mkdir -p "$CONF_DIR"; touch "$HOLDS_FILE"
-    grep -qxF "$n" "$HOLDS_FILE" || echo "$n" >> "$HOLDS_FILE"
+    mkdir -p "$CONF_DIR"
+    grep -qxF "$n" "$HOLDS_FILE" 2>/dev/null || echo "$n" >> "$HOLDS_FILE"
     say "$n held"
 }
 cmd_unhold() {
@@ -44,9 +41,8 @@ cmd_unhold() {
 }
 
 case "${1:-}" in
-    hold)   [[ $EUID -eq 0 ]] || { fail "sudo"; exit 1; }; cmd_hold "${2:?name}"; exit 0 ;;
-    unhold) [[ $EUID -eq 0 ]] || { fail "sudo"; exit 1; }; cmd_unhold "${2:?name}"; exit 0 ;;
-    regen-db) [[ $EUID -eq 0 ]] || { fail "sudo"; exit 1; }; exec /usr/sbin/mlfs-genpkgdb ;;
+    hold)   cmd_hold "${2:?name}"; exit 0 ;;
+    unhold) cmd_unhold "${2:?name}"; exit 0 ;;
 esac
 
 if [[ "$(basename "$0")" == "sol" ]]; then
@@ -60,14 +56,10 @@ fi
 for arg in "$@"; do
     case "$arg" in
         --full) DO_FULL=1 ;;
-        --nvidia) DO_NVIDIA=1 ;;
         --dry-run|--list-dry) DO_DRY=1 ;;
         --list) DO_LIST=1 ;;
-        --gaming) DO_GAMING=1 ;;
         --allow-major) ALLOW_MAJOR=1 ;;
         --no-cache) NO_CACHE=1 ;;
-        --no-nix) DO_NIX=0 ;;
-        --no-flatpak) DO_FP=0 ;;
         --force) FORCE=1 ;;
         --only=*) ONLY="${arg#--only=}" ;;
         --only) ;;
@@ -77,29 +69,21 @@ for arg in "$@"; do
     esac
 done
 
-in_list() { # in_list "a,b" "$name"
+in_list() { 
     [[ -z "$1" ]] && return 1
     [[ ",$1," == *",$2,"* ]]
 }
 is_frozen() { grep -qxF "$1" "$FROZEN_FILE" 2>/dev/null; }
 is_held()   { grep -qxF "$1" "$HOLDS_FILE" 2>/dev/null; }
 ver_gt()    { [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" != "$1" ]]; }
-
-# reject garbage probed versions: prerelease suffixes (rc/beta/alpha/pre/dev)
-# and dotless blobs (date-tags like ibus "20080901", stripped tags like gs
-# "10080") when the installed version is properly dotted.
-version_sane() { # version_sane <new> <old>
-    # strict shape: dotted numerics only (optional p/patch/hotfix suffix).
-    # kills prereleases, "-video" style tag junk, and anything non-version.
+version_sane() { 
     [[ "$1" =~ ^[0-9]+(\.[0-9]+)*([._-]?(p|patch|hotfix|pl)[0-9]+)?$ ]] || return 1
-    # dotless blob vs dotted installed ver — date-tags like ibus "20080901"
     [[ "$1" != *.* && "$2" == *.* ]] && return 1
     return 0
 }
 major_of()  { echo "${1%%.*}"; }
 
-# ---------- probe cache -----------------------------------------------------
-probe_pkg() { # probe_pkg <name> <spec> -> prints latest or ""
+probe_pkg() {
     local name="$1" spec="$2" cache="$PROBE_CACHE/$name" v
     if (( ! NO_CACHE )) && [[ -f "$cache" ]]; then
         if (( $(date +%s) - $(stat -c %Y "$cache") < PROBE_TTL )); then
@@ -113,7 +97,6 @@ probe_pkg() { # probe_pkg <name> <spec> -> prints latest or ""
     echo "$v"
 }
 
-# ---------- db loading ------------------------------------------------------
 declare -A P_VER P_TIER P_PROBE P_ARG P_URLTPL P_AUXTPL P_SCRIPTS
 load_db() {
     local line
@@ -127,27 +110,22 @@ load_db() {
 }
 recipe_exists() { [[ -f "$RECIPES_DIR/$1.sh" ]]; }
 
-# ---------- build executor --------------------------------------------------
 pkg_url()     { echo "${P_URLTPL[$1]//@V@/$2}"; }
 pkg_auxurls() { echo "${P_AUXTPL[$1]//@V@/$2}" | tr ',' ' '; }
 
-fetch() { # fetch <url> <destdir>
+fetch() {
     local u="$1" d="$2" b
     b="$(basename "$u")"
     curl -fsSL --max-time 600 -o "$d/$b" "$u"
 }
 
-# run one db row through build+install with all guards.
-# returns: 0 ok/current, 1 build failed, 2 probe unknown, 3 blocked(policy)
-build_pkg() { # build_pkg <name> <newver>
+build_pkg() {
     local name="$1" new="$2" old="${P_VER[$name]}"
     local work="$BUILD_DIR/$name" plog="$PKGLOG_DIR/$name.log"
     rm -rf "$work"; mkdir -p "$work" "$PKGLOG_DIR"
     (
         echo "== build $name $old -> $new =="
         cd "$work" || exit 1
-
-        # download tarball + aux
         fetch "$(pkg_url "$name" "$new")" "$work" || { echo "DOWNLOAD FAIL"; exit 10; }
         local aux missing_aux=0 a b
         for a in $(pkg_auxurls "$name" "$new"); do
@@ -158,21 +136,15 @@ build_pkg() { # build_pkg <name> <newver>
             }
         done
         if (( missing_aux )); then
-            # aux files are usually REQUIRED patches — without them the build
-            # script's ../<patch> references break or, worse, silently produce
-            # an unpatched package. Skip rather than risk it.
-            echo "AUX MISSING — skipping build (safe veto)"
+            echo "AUX MISSING — skipping build"
             exit 11
         fi
-
         local tarball
         tarball="$(basename "$(pkg_url "$name" "$new")")"
         case "$tarball" in
             *.tar.*|*.tgz|*.zip) : ;;
             *) echo "unsupported archive type: $tarball"; exit 15 ;;
         esac
-
-        # each buildscript gets its own clean extract (64-bit, then lib32)
         local script s i=0 sdir
         IFS=',' read -ra _scripts <<< "${P_SCRIPTS[$name]}"
         for script in "${_scripts[@]}"; do
@@ -180,10 +152,8 @@ build_pkg() { # build_pkg <name> <newver>
             i=$((i+1)); sdir="$work/s$i"; mkdir -p "$sdir"
             case "$tarball" in
                 *.zip) python3 -m zipfile -e "$work/$tarball" "$sdir" || exit 12 ;;
-                *.run) ;;
                 *) tar -xf "$work/$tarball" -C "$sdir" || exit 12 ;;
             esac
-            # stage aux files beside the extract (scripts use ../foo.patch)
             for a in "$work"/*; do
                 [[ "$a" == "$work/$tarball" || -d "$a" ]] && continue
                 cp -f "$a" "$sdir/../" 2>/dev/null || true
@@ -193,8 +163,7 @@ build_pkg() { # build_pkg <name> <newver>
             chmod +x "$s"
             local edir
             edir="$(ls -d "$sdir"/*/ 2>/dev/null | head -1)"
-            echo "-- running $(basename "$script")"
-            [[ -f /etc/profile.d/xorg.sh ]] && . /etc/profile.d/xorg.sh
+            echo "-- running $(basename "$script))"
             ( cd "${edir:-$sdir}"; timeout "$BUILD_TIMEOUT" bash "$s" ) \
                 || { echo "BUILD FAIL rc=$? ($script)"; exit 14; }
         done
@@ -202,36 +171,7 @@ build_pkg() { # build_pkg <name> <newver>
     ) > "$plog" 2>&1
 }
 
-# ---------- stages ----------------------------------------------------------
-do_nix() {
-    [[ -x "$NIX" ]] || { warn "nix missing — skipping"; return 0; }
-    say "nix system profile upgrade..."
-    if NIXPKGS_ALLOW_UNFREE=1 "$NIX" profile upgrade --all --impure; then
-        say "nix upgraded"
-    else
-        warn "nix upgrade failed — fix with: sudo nix profile rollback"
-    fi
-}
-
-do_flatpak() {
-    local FP
-    FP="$(command -v flatpak 2>/dev/null || true)"
-    [[ -z "$FP" && -x /nix/var/nix/profiles/per-user/root/profile/bin/flatpak ]] \
-        && FP=/nix/var/nix/profiles/per-user/root/profile/bin/flatpak
-    [[ -z "$FP" ]] && FP="$(ls /nix/store/*flatpak-*/bin/flatpak 2>/dev/null | head -1)"
-    [[ -n "$FP" ]] || { warn "flatpak missing — skipping"; return 0; }
-    say "flatpak update ($FP)..."
-    "$FP" update --noninteractive -y 2>&1 | tail -3
-    "$FP" uninstall --unused --noninteractive -y 2>&1 | tail -2
-    # GL extension must match installed driver version
-    local drv; drv="$(modinfo -F version nvidia 2>/dev/null | tr '.' '-' )"
-    [[ -n "$drv" ]] || drv="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | tr '.' '-')"
-    if [[ -n "$drv" && ! -d "/var/lib/flatpak/extension/org.freedesktop.Platform.GL.nvidia-${drv}" ]]; then
-        warn "flatpak GL extension missing for driver $drv — flatpaks have no GPU (see mlfs-context.md)"
-    fi
-}
-
-run_tier() { # run_tier <tierlist>
+run_tier() {
     local tiers="$1" name new old tier updated=() failed=() skipped=()
     for name in "${ORDER[@]}"; do
         tier="${P_TIER[$name]}"
@@ -240,12 +180,11 @@ run_tier() { # run_tier <tierlist>
         in_list "$SKIP" "$name" && { skipped+=("$name"); continue; }
         is_frozen "$name" && { skipped+=("$name(frozen)"); continue; }
         is_held "$name" && { skipped+=("$name(held)"); continue; }
-        recipe_exists "$name" && continue   # hand recipes run in their own stage
+        recipe_exists "$name" && continue
         old="${P_VER[$name]}"
         new="$(probe_pkg "$name" "${P_PROBE[$name]}:${P_ARG[$name]}")"
         [[ -z "$new" ]] && { skipped+=("$name(probe?)"); continue; }
         (( FORCE )) || { version_sane "$new" "$old" && ver_gt "$new" "$old"; } || continue
-        # policy: critical packages stay on the same major unless allowed
         if [[ "$tier" == "critical" && $ALLOW_MAJOR -eq 0 ]] \
             && [[ "$(major_of "$new")" != "$(major_of "$old")" ]]; then
             warn "$name $old -> $new crosses major — holding (use --allow-major)"
@@ -253,12 +192,8 @@ run_tier() { # run_tier <tierlist>
             continue
         fi
         say "$name: $old -> $new — building"
-        local soname_before="$STATE_DIR/sonames-$name.before"
-        [[ "$tier" =~ lib|critical|gaming ]] && soname_inventory > "$soname_before"
         if build_pkg "$name" "$new"; then
-            soname_guard "$soname_before"
             updated+=("$name $old -> $new")
-            # make db authoritative for next run
             sed -i "s/^$(printf '%s' "$name" | sed 's/[][\.*^$/]/\\&/g')\t[^\t]*/$name\t$new/" "$DB"
             echo "$new" > "$STATE_DIR/$name.version"
         else
@@ -274,7 +209,7 @@ run_tier() { # run_tier <tierlist>
     FAILED_PKGS+=("${failed[@]}")
 }
 
-run_recipes() { # legacy packages.d/*.sh overrides — same API as v1
+run_recipes() {
     shopt -s nullglob
     for recipe in "$RECIPES_DIR"/*.sh; do
         local rname; rname="$(basename "$recipe" .sh)"
@@ -310,59 +245,7 @@ run_recipes() { # legacy packages.d/*.sh overrides — same API as v1
     done
 }
 
-do_nvidia() { # the manual driver stage — opt-in only
-    local name="nvidia" old="${P_VER[nvidia]:-615.71.09}" new
-    new="$(probe_pkg nvidia "${P_PROBE[nvidia]}:${P_ARG[nvidia]}")"
-    [[ -z "$new" ]] && { warn "nvidia: cannot probe latest driver"; return 1; }
-    ver_gt "$new" "$old" || { say "nvidia $old is current"; return 0; }
-    say "nvidia: $old -> $new — driver update"
-    # kernel headers must exist for the running kernel
-    if [[ ! -f "/lib/modules/$(uname -r)/build/Makefile" ]]; then
-        fail "kernel headers missing for $(uname -r) — cannot build nvidia module"
-        return 1
-    fi
-    local work="$BUILD_DIR/nvidia" run="$work/NVIDIA-Linux-x86_64-$new.run"
-    mkdir -p "$work"
-    curl -fsSL --max-time 900 -o "$run" \
-        "https://us.download.nvidia.com/XFree86/Linux-x86_64/$new/NVIDIA-Linux-x86_64-$new.run" \
-        || { fail "nvidia runfile download failed"; return 1; }
-    sh "$run" --check >/dev/null 2>&1 || warn "runfile self-check failed — continuing anyway"
-    say "installing driver (kernel module + userland)..."
-    if ! ( cd "$work" && sh "$run" -z -j "$JOBS" -k "$(uname -r)" --no-peermem \
-        --override-file-type-destination=OPENCL_WRAPPER_LIB:/tmp/nvidia \
-        --override-file-type-destination=OPENCL_WRAPPER_SYMLINK:/tmp/nvidia ) \
-        > "$PKGLOG_DIR/nvidia.log" 2>&1; then
-        fail "nvidia installer failed — see $PKGLOG_DIR/nvidia.log"
-        return 1
-    fi
-    # smoke: module file exists with the new version
-    local modv; modv="$(modinfo -F version nvidia 2>/dev/null || true)"
-    if [[ "$modv" != "$new" ]]; then
-        warn "nvidia module reports $modv (expected $new) — may need reboot"
-    fi
-    ldconfig
-    # rebuild flatpak GL extension for the new version
-    local dash="${new//./-}" ext
-    for branch in 25.08 26.08; do
-        ext="/var/lib/flatpak/extension/org.freedesktop.Platform.GL.nvidia-${dash}/x86_64/$branch"
-        mkdir -p "$ext/lib" "$ext/lib/gbm" \
-                 "$ext/share/vulkan/icd.d" "$ext/share/glvnd/egl_vendor.d" \
-                 "$ext/share/egl/egl_external_platform.d"
-        cp -a /usr/lib/libnvidia-*.so* /usr/lib/libEGL_nvidia.so* \
-              /usr/lib/libGLX_nvidia.so* "$ext/lib/" 2>/dev/null
-        cp -a /usr/lib/gbm/nvidia-drm_gbm.so "$ext/lib/gbm/" 2>/dev/null
-        cp -a /usr/share/vulkan/icd.d/nvidia_icd*.json "$ext/share/vulkan/icd.d/" 2>/dev/null
-        cp -a /usr/share/glvnd/egl_vendor.d/10_nvidia.json "$ext/share/glvnd/egl_vendor.d/" 2>/dev/null
-        cp -a /usr/share/egl/egl_external_platform.d/*nvidia* "$ext/share/egl/egl_external_platform.d/" 2>/dev/null
-    done
-    say "flatpak GL extension rebuilt for $new"
-    sed -i "s/^nvidia\t[^\t]*/nvidia\t$new/" "$DB"
-    say "nvidia $new installed — REBOOT required to load the new module"
-}
-
-# ---------- main ------------------------------------------------------------
-[[ $EUID -eq 0 ]] || { fail "run as root (sudo mlfs-update)"; exit 1; }
-[[ -f "$DB" ]] || { fail "no packages.db — run: sudo mlfs-genpkgdb"; exit 1; }
+[[ -f "$DB" ]] || { fail "no packages.db — add packages to $DB first"; exit 1; }
 
 if (( DO_LIST )); then
     load_db
@@ -377,16 +260,14 @@ exec 9>"$LOCK"; flock -n 9 || { fail "already running"; exit 1; }
 mkdir -p "$STATE_DIR" "$BUILD_DIR" "$PKGLOG_DIR" "$PROBE_CACHE"
 exec > >(tee -a "$LOG") 2>&1
 
-say "=== mlfs-update $(date -Is) ==="
+say "=== sol $(date -Is) ==="
 load_db
 ORDER=($(awk -F'\t' '!/^#/{print $1}' "$DB"))
 UPDATED_PKGS=(); FAILED_PKGS=()
 
-preflight || exit 1
 curl -sf --max-time 10 -o /dev/null https://www.kernel.org \
     || { warn "no network — nothing to update"; exit 0; }
 
-# ---- probe phase: figure out what WOULD update -----------------------------
 say "probing upstream (${#ORDER[@]} packages)..."
 PENDING=()
 for name in "${ORDER[@]}"; do
@@ -399,11 +280,11 @@ for name in "${ORDER[@]}"; do
     recipe_exists "$name" && continue
     case "$tier" in
         leaf|lib) ;;
-        critical|gaming) (( DO_FULL || DO_GAMING )) || continue ;;
+        critical) (( DO_FULL )) || continue ;;
     esac
     echo "$name"
 done | xargs -P 8 -I{} bash -c '
-    source /usr/lib/mlfs-update/probe.sh
+    source "$LIB/probe.sh"
     n="{}"; cache="'"$PROBE_CACHE"'/$n"
     if [[ -f "$cache" && $(( $(date +%s) - $(stat -c %Y "$cache") )) -lt '"$PROBE_TTL"' ]]; then
         v="$(cat "$cache")"
@@ -430,52 +311,12 @@ if (( DO_DRY )); then
     exit 0
 fi
 
-# ---- snapshot BEFORE touching anything --------------------------------------
-say "pre-update snapshot..."
-"$SNAP" create "pre-update" || { fail "snapshot failed — aborting"; exit 1; }
-SNAP_DIR="$(latest_snapshot)"
-[[ -d "$SNAP_DIR/usr" ]] || { fail "snapshot integrity check failed"; exit 1; }
-
-say "baseline linkage scan..."
-linkage_scan "$STATE_DIR/linkage.before" >/dev/null
-
-(( DO_NIX )) && do_nix
-(( DO_FP )) && do_flatpak
 run_recipes
 run_tier "leaf,lib"
-(( DO_FULL ))            && run_tier "critical"
-(( DO_FULL || DO_GAMING )) && run_tier "gaming"
-(( DO_NVIDIA ))          && do_nvidia
-
-# ---- post-flight ------------------------------------------------------------
-say "post-update linkage scan..."
-linkage_scan "$STATE_DIR/linkage.after" >/dev/null
-if ! linkage_diff_ok "$STATE_DIR/linkage.before" "$STATE_DIR/linkage.after"; then
-    restore_snapshot_now
-    exit 1
-fi
-
-say "sanity checks..."
-if [[ -x "$SANITY" ]] && ! "$SANITY"; then
-    fail "sanity failed — flagging snapshot for boot-time restore"
-    "$SNAP" last --boot || warn "flag failed"
-    rm -f "$STATE_DIR/last-ok"
-    exit 1
-fi
-
-touch "$STATE_DIR/last-ok"
-
-# boot-verify: if the next boot never reaches graphical.target, bootguard
-# auto-restores this run's pre-update snapshot (A/B-style boot counting).
-if ((${#UPDATED_PKGS[@]})) && [[ -n "${SNAP_DIR:-}" ]]; then
-    echo "$(basename "$SNAP_DIR") 0" > "$STATE_DIR/boot-verify"
-    say "boot-verify armed: next boot must reach graphical.target or auto-rollback"
-fi
-
-"$SNAP" prune
+(( DO_FULL )) && run_tier "critical"
 
 say "=== done ==="
 say "updated: ${#UPDATED_PKGS[@]}  failed: ${#FAILED_PKGS[@]}"
 ((${#FAILED_PKGS[@]})) && printf '   FAILED: %s\n' "${FAILED_PKGS[@]}"
-say "log: $LOG — rollback: sudo snapshot last"
+say "log: $LOG"
 exit 0
