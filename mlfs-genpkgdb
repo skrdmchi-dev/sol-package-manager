@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+# mlfs-genpkgdb — generate /etc/mlfs-update/packages.db from the LFS build
+# manifests and runtime build scripts in /lfs-build.
+#
+# db row (tab-separated):
+#   name  installed  tier  probe  arg  urltpl  auxtpls  buildscripts
+#
+# probe kinds: github, gh-tags, gl-tags, sf, gnome, gnu, dir, none
+# tiers:       leaf | lib | critical | gaming | manual | frozen
+#
+# Run:  sudo mlfs-genpkgdb [--stdout]
+
+import os, re, sys, glob, urllib.parse
+
+BUILD = "/lfs-build"
+DB_OUT = "/etc/mlfs-update/packages.db"
+MANIFESTS = [
+    (f"{BUILD}/blfs/manifest.txt",  f"{BUILD}/blfs/runtime"),
+    (f"{BUILD}/glfs/manifest.txt",  f"{BUILD}/glfs/runtime"),
+    (f"{BUILD}/glfs/manifest32.txt", f"{BUILD}/glfs/runtime32"),
+]
+CUSTOM = f"{BUILD}/glfs/custom"
+
+CRITICAL = re.compile(
+    r"^(systemd|dbus|networkmanager|network-manager-applet|modemmanager|polkit|"
+    r"upower|glib2|gobject-introspection|gtk\+?3?|gtkmm|pango|cairo|cairomm|"
+    r"gdk-pixbuf|librsvg|at-spi2.*|gjs|gnome-.*|mutter|gdm|pipewire|wireplumber|"
+    r"gstreamer.*|gst-.*|mesa|libdrm|glvnd|vulkan.*|xorg-server|xwayland|"
+    r"wayland.*|xkbcommon|libinput|freetype2|harfbuzz|fontconfig|icu|libxml2|"
+    r"sqlite|openssl.*|gnutls|p11-kit|nss|nspr|nettle|libtasn1|linux-pam|"
+    r"libcap|libseccomp|elfutils|kmod|seatd|cups.*|bluez|colord|accountsservice|"
+    r"geoclue.*|gnome-keyring|gvfs|tinysparql|localsearch|libgudev|libwacom|"
+    r"libnvme|libblockdev|udisks|samba|avahi|sane.*|hplip|alsa.*|ffmpeg|"
+    r"node.*|llvm.*|rust.*|cbindgen|python.*|perl.*|ruby|vala|sudo|openssh|"
+    r"shadow|util-linux|bash|readline|glibmm|libsigc.*|epoxy|libepoxy|"
+    r"power-profiles-daemon|switcheroo.*|xdg-desktop-portal.*|flatpak|"
+    r"ostree|appstream|bubblewrap|xdg-user-dirs|shared-mime-info|"
+    r"glib-networking|libsoup.*|libsecret|"
+    r"libcloudproviders|libportal|webrtc-audio.*|spice.*|libvirt.*|"
+    r"gtk4|gtk-[0-9].*|libadwaita.*|adw.*|gcr.*|glycin.*|tecla|"
+    r"evolution-data-server|gsettings-.*|dconf|libgweather.*|"
+    r"pygobject.*|vte.*|webkitgtk.*|wpe.*|libwpe.*|gsound|nautilus|"
+    r"libmanette|libdex|libpanel|libspelling|tinysparql|"
+    r"binutils|gcc|glibc|linux|linux-firmware|p11-kit|ca-certificates?)$"
+)
+GAMING = re.compile(
+    r"^(wine|vkd3d.*|dxvk|lutris|gamemode|mangohud|gamescope|proton.*|"
+    r"mingw-w64.*|opencl.*|vulkan-headers|vulkan-loader|spirv.*|glslang)$"
+)
+MANUAL = re.compile(r"^(nvidia|steam|docbook|docbook-xml|xorg-env|xorg7-.*|lame)$")
+LEAF = re.compile(
+    r"^(htop|nano|vim|wget|curl|git|rsync|tmux|screen|tree|jq|which|unzip|zip|"
+    r"p7zip|unrar|less|man-.*|iana-etc|make-ca|docbook.*|sgml.*|.*-doc|"
+    r".*-data|.*-icons?|.*-theme.*|hicolor.*|adwaita.*|sound-theme.*|"
+    r"desktop-file-utils|shared-mime-info|graphite2|boost|cmake|ninja|meson|"
+    r"pkgconf|pkg-config|autoconf.*|automake|libtool|intltool|itstool|"
+    r"xmlto|asciidoc|gtk-doc|doxygen|valgrind|strace|lsof|gdb|ccache|distcc|"
+    r"duktape|inih|cython|.*-tests?|iso-codes|tzdata|xbitmaps|"
+    r"util-macros|xorgproto|xcb-proto|xtrans|makedepend|imake|gccmakedep|"
+    r"lndir|font-.*|.*-font.*|dejavu|noto|cantarell|"
+    r"gsfonts|urw-.*|fonts.*|tiff|jasper|openjpeg|lcms.*|libjpeg.*|libwebp|"
+    r"libexif|libraw|qpdf|poppler|gsview|mupdf|psutils|enscript|a2ps|"
+    r"cups-filters|ghostscript|gutenprint|foomatic.*|colord-gtk|"
+    r"imagemagick|graphviz|gtksourceview.*|vte.*|libpeas.*|gspell|enchant|"
+    r"hunspell|aspell|hyphen|libvoikko|"
+    r"evince|eog|file-roller|baobab|gparted|gnome-disk-utility|seahorse|"
+    r"simple-scan|cheese|snapshot|rhythmbox|totem|brasero|sound-juicer|pitivi|"
+    r"shotwell|gimp|inkscape|dia|xournal|libreoffice|abiword|gnumeric|"
+    r"evolution.*|thunderbird.*|pidgin|hexchat|telepathy.*|remmina|vinagre|"
+    r"tigervnc|rdesktop|freerdp|spice-gtk|qemu|virt-manager|virt-viewer|"
+    r"flatpak-builder|gnome-software|orca|accerciser|devhelp|"
+    r"sysprof|dconf-editor|polari|fractal|lollypop|shortwave|podcasts|"
+    r"adw.*|libadwaita.*|libhandy.*)$"
+)
+
+def strip_suffixes(b):
+    return re.sub(r"[-_.]?(sources?|src|stable|all|docs?|nons|orig|dfsg|dist|"
+                  r"bin|unix|linux|release|snapshot|install(er)?|final|public)$",
+                  "", b, flags=re.I)
+
+def ver_from_base(pkgname, base):
+    b = re.sub(r"\.(tar\.(xz|gz|bz2|lz|zst)|tgz|zip|run|deb|patch|diff)$", "", base)
+    b = strip_suffixes(b)
+    # dotted version anywhere (handles icu4c-78.3, NVIDIA-...-615.71.09)
+    m = re.search(r"([0-9]+\.[0-9][0-9A-Za-z.]*)", b)
+    if m: return m.group(1)
+    # name prefix then bare number
+    m = re.search(r"^" + re.escape(pkgname) + r"[^0-9]*([0-9]+)", b, re.I)
+    if m: return m.group(1)
+    # datestamp or bare number
+    m = re.search(r"([0-9]{6,}|[0-9]+)", b)
+    if m: return m.group(1)
+    return ""
+
+def classify(url, fname, ver):
+    """(probe, arg) — decide how to check for a newer upstream release."""
+    m = re.match(r"https?://github\.com/([^/]+/[^/]+)/releases/download/", url)
+    if m: return ("github", m.group(1))
+    m = re.match(r"https?://github\.com/([^/]+/[^/]+)/archive/", url)
+    if m: return ("gh-tags", m.group(1))
+    m = re.match(r"https?://download\.gnome\.org/sources/([^/]+)/", url)
+    if m: return ("gnome", m.group(1))
+    m = re.match(r"https?://(?:ftp|ftpmirror)\.gnu\.org/gnu/([^/]+)/", url)
+    if m: return ("gnu", m.group(1))
+    m = re.match(r"https?://downloads\.sourceforge\.net/([^/]+)/", url)
+    if m: return ("sf", f"{m.group(1)}:{fname.replace(ver,'(@V@)')}")
+    m = re.match(r"https?://gitlab\.freedesktop\.org/([^/]+/[^/]+)/-/archive/", url)
+    if m:
+        return ("gl-tags", f"gitlab.freedesktop.org/{urllib.parse.quote(m.group(1), safe='')}")
+    # generic dir listing — but if the parent dir is version-named
+    # (files/v4.4/, dist/v1.52.1/, xml/4.5/) probe the grandparent instead.
+    parent = url.rsplit("/", 1)[0]
+    seg = parent.rsplit("/", 1)[-1]
+    segdigits = re.sub(r"[^0-9.]", "", seg) if ver else ""
+    if re.fullmatch(r"v?[0-9]+([._-][0-9A-Za-z]+)*", seg) and ver:
+        if segdigits.rstrip(".") == ver or "x" not in seg and not ver.startswith(segdigits):
+            # seg IS the whole installed version -> newer releases appear as
+            # sibling dirs; probe the grandparent listing
+            grand = parent.rsplit("/", 1)[0] + "/"
+            return ("dir", f"{grand}:(@V@)/")
+        # seg is a version family/prefix (files/v4.4/, source/11.x/) ->
+        # probe inside it for the newest tarball of the same family
+        return ("dir", f"{parent}/:{fname.replace(ver, '(@V@)')}")
+    return ("dir", f"{parent}/:{fname.replace(ver, '(@V@)')}")
+
+def tier_for(name):
+    if MANUAL.match(name):  return "manual"
+    if GAMING.match(name):  return "gaming"
+    if CRITICAL.match(name): return "critical"
+    if LEAF.match(name):    return "leaf"
+    return "lib"
+
+def script_for(name, dirs):
+    for d in dirs:
+        for cand in (f"{d}/{name}.sh", f"{d}/blfs-{name}.sh"):
+            if os.path.isfile(cand):
+                return cand
+    hits = sorted(glob.glob(f"{CUSTOM}/{name}*.sh") + glob.glob(f"{CUSTOM}/blfs-{name}*.sh"))
+    return hits[0] if hits else ""
+
+rows, order = {}, []
+
+for man, rdir in MANIFESTS:
+    if not os.path.isfile(man): continue
+    for line in open(man):
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) < 3 or parts[0] != "pkg":
+            continue
+        name, urls = parts[1], parts[2].split()
+        is32 = name.endswith("-lib32")
+        base = re.sub(r"-lib32$", "", name)
+        base = re.sub(r"^(blfs|chapter\d+)-", "", base)
+        tarballs = [u for u in urls if re.search(r"\.(tar\.[a-z0-9]+|tgz|zip|run|deb)$", u, re.I)]
+        aux = [u for u in urls if u not in tarballs and u != "-"]
+        main = tarballs[0] if tarballs else ""
+        fname = os.path.basename(main) if main else ""
+        ver = ver_from_base(base, fname) if main else ""
+        script = script_for(name, [rdir]) or script_for(base, [rdir])
+        lname = base.lower()
+        rec = rows.get(base)
+        if rec is None:
+            rec = {"name": base, "installed": ver, "tier": tier_for(lname),
+                   "probe": "none", "arg": "", "urltpl": main, "auxtpls": "",
+                   "scripts": []}
+            rows[base] = rec
+            order.append(base)
+        # last manifest wins for version/probe/url
+        if main:
+            if ver: rec["installed"] = ver
+            if ver:
+                rec["urltpl"] = main.replace(ver, "@V@")
+                rec["probe"], rec["arg"] = classify(main, fname, ver)
+            else:
+                rec["urltpl"] = main
+            rec["auxtpls"] = ",".join(
+                u.replace(ver, "@V@") if ver else u for u in aux)
+        if script and script not in rec["scripts"]:
+            rec["scripts"].append(script)
+
+out = ["# mlfs-update package database — generated by mlfs-genpkgdb",
+       "# name\tinstalled\ttier\tprobe\targ\turltpl\tauxtpls\tbuildscripts"]
+for n in order:
+    r = rows[n]
+    out.append("\t".join([
+        r["name"], r["installed"] or "?", r["tier"], r["probe"], r["arg"],
+        r["urltpl"], r["auxtpls"], ",".join(r["scripts"]),
+    ]))
+
+data = "\n".join(out) + "\n"
+if "--stdout" in sys.argv:
+    sys.stdout.write(data)
+else:
+    os.makedirs(os.path.dirname(DB_OUT), exist_ok=True)
+    with open(DB_OUT, "w") as f: f.write(data)
+    tiers = {}
+    for n in order: tiers[rows[n]["tier"]] = tiers.get(rows[n]["tier"], 0) + 1
+    print(f"wrote {DB_OUT}: {len(order)} packages — {tiers}")
